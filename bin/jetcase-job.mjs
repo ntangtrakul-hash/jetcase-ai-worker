@@ -6,6 +6,7 @@
 //   node bin/jetcase-job.mjs start <job token>   save the token, fetch the job -> work/job.json
 //   node bin/jetcase-job.mjs download            every file -> work/files/, index in work/files.json
 //   node bin/jetcase-job.mjs pending             files not yet in the ledger (work/ledger/*.jsonl)
+//   node bin/jetcase-job.mjs assemble            ledger + category notes -> work/result.json
 //   node bin/jetcase-job.mjs check work/result.json    jetcase's checks, nothing saved
 //   node bin/jetcase-job.mjs submit work/result.json
 //   node bin/jetcase-job.mjs fail "reason"
@@ -92,7 +93,9 @@ async function cmdStart(tok) {
     return;
   }
   console.log(`Job ${job.jobId}: matter ${job.ourFile}, plaintiff "${job.plaintiffName || '(single plaintiff)'}"`);
-  console.log(`${job.categories.length} categories, ${job.files.length} files. Details in work/job.json.`);
+  const c = job.counts || { total: job.files.length, toRead: job.files.length, known: 0 };
+  console.log(`${job.categories.length} categories. ${c.total} files in the folder: ${c.toRead} to read, ${c.known} already read (see "known" in work/job.json -- do NOT open those again).`);
+  if (!job.files.length) console.log('Nothing new to read. Judge the folder from "known", write work/category-notes.json if needed, then run assemble, check and submit.');
   const big = job.files.filter(f => f.tooLarge);
   if (big.length) console.log(`${big.length} file(s) over 60MB cannot be downloaded -- list them as unreadable: ${big.map(f => f.name).join(', ')}`);
 }
@@ -153,6 +156,46 @@ async function cmdPending() {
   left.forEach(f => console.log(`  ${f.id}\t${f.folderPath ? f.folderPath + '/' : ''}${f.name}`));
 }
 
+// Builds work/result.json from the ledger (every line of work/ledger/*.jsonl
+// is one file's entry) plus the optional work/category-notes.json,
+// work/flags.json and work/notes.txt -- so the result is never retyped by
+// hand, and jetcase builds the checklist from the entries.
+function cmdAssemble() {
+  const job = JSON.parse(fs.readFileSync(path.join(WORK, 'job.json'), 'utf8'));
+  const dir = path.join(WORK, 'ledger');
+  const byId = new Map();
+  if (fs.existsSync(dir)) {
+    for (const f of fs.readdirSync(dir).filter(n => n.endsWith('.jsonl')).sort()) {
+      fs.readFileSync(path.join(dir, f), 'utf8').split('\n').forEach((line, i) => {
+        if (!line.trim()) return;
+        let e;
+        try { e = JSON.parse(line); } catch { die(`${f} line ${i + 1} is not valid JSON -- fix it and run assemble again.`); }
+        if (e && e.id) byId.set(e.id, e); // a later line for the same file wins
+      });
+    }
+  }
+  const readJson = (name, fallback) => {
+    const p = path.join(WORK, name);
+    if (!fs.existsSync(p)) return fallback;
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (err) { die(`${name} is not valid JSON: ${err.message}`); }
+  };
+  const want = new Set(job.files.map(f => f.id));
+  const entries = [...byId.values()].filter(e => want.has(e.id));
+  const extra = [...byId.keys()].filter(id => !want.has(id));
+  const notesPath = path.join(WORK, 'notes.txt');
+  const result = {
+    entries,
+    categoryNotes: readJson('category-notes.json', {}),
+    flags: readJson('flags.json', []),
+    notes: fs.existsSync(notesPath) ? fs.readFileSync(notesPath, 'utf8').trim().slice(0, 2000) : '',
+  };
+  fs.writeFileSync(path.join(WORK, 'result.json'), JSON.stringify(result, null, 2));
+  console.log(`Wrote work/result.json: ${entries.length} of ${job.files.length} files to read have an entry.`);
+  if (extra.length) console.log(`Ignored ${extra.length} ledger line(s) for files not in this job's "files" (already-read files keep their stored entry).`);
+  const missing = job.files.filter(f => !byId.has(f.id));
+  if (missing.length) console.log(`Still missing an entry: ${missing.length} -- run pending.`);
+}
+
 async function cmdCheck(file) {
   if (!file || !fs.existsSync(file)) die('Give the path to the result JSON.');
   let body;
@@ -203,9 +246,9 @@ async function cmdTest() {
 }
 
 const [cmd, arg] = process.argv.slice(2);
-const run = { start: () => cmdStart(arg), download: cmdDownload, pending: cmdPending, check: () => cmdCheck(arg), submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest }[cmd];
+const run = { start: () => cmdStart(arg), download: cmdDownload, pending: cmdPending, assemble: async () => cmdAssemble(), check: () => cmdCheck(arg), submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest }[cmd];
 if (!run) {
-  console.log('usage: node bin/jetcase-job.mjs start <token> | download | pending | check <result.json> | submit <result.json> | fail "<reason>" | test');
+  console.log('usage: node bin/jetcase-job.mjs start <token> | download | pending | assemble | check <result.json> | submit <result.json> | fail "<reason>" | test');
   process.exit(1);
 }
 run().catch(err => die(err.message));
