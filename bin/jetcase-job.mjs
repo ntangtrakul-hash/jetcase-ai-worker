@@ -5,6 +5,8 @@
 //
 //   node bin/jetcase-job.mjs start <job token>   save the token, fetch the job -> work/job.json
 //   node bin/jetcase-job.mjs download            every file -> work/files/, index in work/files.json
+//   node bin/jetcase-job.mjs pending             files not yet in the ledger (work/ledger/*.jsonl)
+//   node bin/jetcase-job.mjs check work/result.json    jetcase's checks, nothing saved
 //   node bin/jetcase-job.mjs submit work/result.json
 //   node bin/jetcase-job.mjs fail "reason"
 //   node bin/jetcase-job.mjs test                a test run: report tool versions, read nothing
@@ -112,6 +114,44 @@ async function cmdDownload() {
   console.log(`Downloaded ${ok} of ${job.files.length} files into work/files/. Index (id -> local path) in work/files.json.`);
 }
 
+// The ledger: one JSON object per line, one line per file, in
+// work/ledger/*.jsonl (one file per batch, so parallel helpers never write
+// the same file). Only `id` matters here; the skill defines the rest.
+function ledgerIds() {
+  const dir = path.join(WORK, 'ledger');
+  const ids = new Set();
+  if (!fs.existsSync(dir)) return ids;
+  for (const f of fs.readdirSync(dir).filter(n => n.endsWith('.jsonl'))) {
+    fs.readFileSync(path.join(dir, f), 'utf8').split('\n').forEach((line, i) => {
+      if (!line.trim()) return;
+      try { const e = JSON.parse(line); if (e && e.id) ids.add(e.id); } catch { console.error(`  ${f} line ${i + 1} is not valid JSON -- fix it`); }
+    });
+  }
+  return ids;
+}
+
+function cmdPending() {
+  const job = JSON.parse(fs.readFileSync(path.join(WORK, 'job.json'), 'utf8'));
+  if (job.kind !== 'read') die('A test run has no files.');
+  const done = ledgerIds();
+  const left = job.files.filter(f => !done.has(f.id));
+  console.log(`${job.files.length - left.length} of ${job.files.length} files are in the ledger; ${left.length} still to read.`);
+  left.forEach(f => console.log(`  ${f.id}\t${f.folderPath ? f.folderPath + '/' : ''}${f.name}`));
+}
+
+async function cmdCheck(file) {
+  if (!file || !fs.existsSync(file)) die('Give the path to the result JSON.');
+  let body;
+  try { body = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) { die('The result file is not valid JSON: ' + err.message); }
+  try {
+    const out = await call('POST', '/check', { body });
+    console.log('CHECK PASSED (nothing saved yet): ' + JSON.stringify(out.summary));
+    if (out.summary.unknownDocs && out.summary.unknownDocs.length) console.log('Unknown documents (fix the ids/names): ' + out.summary.unknownDocs.join('; '));
+  } catch (err) {
+    die(`CHECK FAILED: ${err.message}\nFix work/result.json and run check again.`);
+  }
+}
+
 async function cmdSubmit(file) {
   if (!file || !fs.existsSync(file)) die('Give the path to the result JSON.');
   let body;
@@ -148,9 +188,9 @@ async function cmdTest() {
 }
 
 const [cmd, arg] = process.argv.slice(2);
-const run = { start: () => cmdStart(arg), download: cmdDownload, submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest }[cmd];
+const run = { start: () => cmdStart(arg), download: cmdDownload, pending: async () => cmdPending(), check: () => cmdCheck(arg), submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest }[cmd];
 if (!run) {
-  console.log('usage: node bin/jetcase-job.mjs start <token> | download | submit <result.json> | fail "<reason>" | test');
+  console.log('usage: node bin/jetcase-job.mjs start <token> | download | pending | check <result.json> | submit <result.json> | fail "<reason>" | test');
   process.exit(1);
 }
 run().catch(err => die(err.message));

@@ -15,8 +15,10 @@ Follow the `careful-medical-checklist` skill in this repository exactly,
 using that token:
 1. Run `node bin/jetcase-job.mjs start <token>`.
 2. If it's a test run, run `node bin/jetcase-job.mjs test` and stop.
-3. Otherwise, download, read every file, write `work/result.json`, and
-   submit it.
+3. Otherwise, download and read **every** file into the ledger, build
+   `work/result.json`, run `check` until it passes, then submit it. Never
+   skip a file: jetcase rejects a result that leaves any file unaccounted
+   for.
 
 Only talk to jetcase through `bin/jetcase-job.mjs`. Don't create
 branches, commit, push or open pull requests. Don't send any record or
