@@ -83,6 +83,10 @@ Write each file's entry right after reading it, **never at the end**, so
 nothing is lost if the run is long. Run `node bin/jetcase-job.mjs pending`
 at any time to list the files still missing from the ledger.
 
+**Run `pending` after every batch.** It also tells jetcase how far along
+you are ("Reading: 45 of 112 files"), which is what the firm watches on
+the checklist card.
+
 **One ledger line per file:**
 
 ```json

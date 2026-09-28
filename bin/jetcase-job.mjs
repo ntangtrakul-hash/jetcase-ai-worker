@@ -67,6 +67,15 @@ async function call(method, p, { body, raw } = {}) {
   return data;
 }
 
+// Tells jetcase what the run is doing, for the checklist card's status line.
+// Best effort: a failed report never stops the run.
+async function progress(phase, done, total) {
+  try {
+    const headers = { Authorization: 'Bearer ' + token(), 'Content-Type': 'application/json' };
+    await fetch(base() + '/progress', { method: 'POST', headers, body: JSON.stringify({ phase, done, total }) });
+  } catch { /* ignore */ }
+}
+
 function safeName(s) {
   return String(s).replace(/[^\w.() -]/g, '_').slice(0, 150);
 }
@@ -95,7 +104,10 @@ async function cmdDownload() {
   fs.mkdirSync(dir, { recursive: true });
   const index = [];
   let ok = 0;
+  await progress('downloading', 0, job.files.length);
+  let n = 0;
   for (const f of job.files) {
+    if (++n % 20 === 0) await progress('downloading', n, job.files.length);
     const local = path.join(dir, f.id.slice(-12).replace(/[^\w-]/g, '_') + '__' + safeName(f.name));
     const entry = { id: f.id, name: f.name, folderPath: f.folderPath, size: f.size, local: path.relative(process.cwd(), local), error: null };
     if (f.tooLarge) { entry.error = 'larger than 60MB'; index.push(entry); continue; }
@@ -111,6 +123,7 @@ async function cmdDownload() {
     index.push(entry);
   }
   fs.writeFileSync(path.join(WORK, 'files.json'), JSON.stringify(index, null, 2));
+  await progress('reading', ledgerIds().size, job.files.length);
   console.log(`Downloaded ${ok} of ${job.files.length} files into work/files/. Index (id -> local path) in work/files.json.`);
 }
 
@@ -130,11 +143,12 @@ function ledgerIds() {
   return ids;
 }
 
-function cmdPending() {
+async function cmdPending() {
   const job = JSON.parse(fs.readFileSync(path.join(WORK, 'job.json'), 'utf8'));
   if (job.kind !== 'read') die('A test run has no files.');
   const done = ledgerIds();
   const left = job.files.filter(f => !done.has(f.id));
+  await progress('reading', job.files.length - left.length, job.files.length);
   console.log(`${job.files.length - left.length} of ${job.files.length} files are in the ledger; ${left.length} still to read.`);
   left.forEach(f => console.log(`  ${f.id}\t${f.folderPath ? f.folderPath + '/' : ''}${f.name}`));
 }
@@ -144,6 +158,7 @@ async function cmdCheck(file) {
   let body;
   try { body = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) { die('The result file is not valid JSON: ' + err.message); }
   try {
+    await progress('checking', null, null);
     const out = await call('POST', '/check', { body });
     console.log('CHECK PASSED (nothing saved yet): ' + JSON.stringify(out.summary));
     if (out.summary.unknownDocs && out.summary.unknownDocs.length) console.log('Unknown documents (fix the ids/names): ' + out.summary.unknownDocs.join('; '));
@@ -188,7 +203,7 @@ async function cmdTest() {
 }
 
 const [cmd, arg] = process.argv.slice(2);
-const run = { start: () => cmdStart(arg), download: cmdDownload, pending: async () => cmdPending(), check: () => cmdCheck(arg), submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest }[cmd];
+const run = { start: () => cmdStart(arg), download: cmdDownload, pending: cmdPending, check: () => cmdCheck(arg), submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest }[cmd];
 if (!run) {
   console.log('usage: node bin/jetcase-job.mjs start <token> | download | pending | check <result.json> | submit <result.json> | fail "<reason>" | test');
   process.exit(1);
