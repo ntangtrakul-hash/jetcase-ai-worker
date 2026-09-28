@@ -138,6 +138,39 @@ Repeat until `pending` says **0 still to read**.
 **Full-tier fields**, where they apply. Each item carries `page` and
 `quote`.
 
+**What these must capture** (reading rules version 2; the firm's summary
+is built from exactly this):
+- **Every level the radiologist reported, normal levels too.** Write one
+  `findings` item per level or structure, for example "C2-3 normal", "C3-4
+  right paracentral herniation with thecal-sac impingement and cord
+  flattening", "C4-5 central herniation with annular tear". Never write just
+  "multilevel findings".
+- **Doctors' full names**, as written, with the credential:
+  `radiologist` on every study, `clinician` on every visit, procedure and
+  report ("Dr. Muhammad Moral, MD", not "Moral" or initials).
+- **`provider`** is the facility or practice name as written.
+  **`facilityAddress`** is its street address when the record shows one.
+- **Operative reports:** in `procedures`, **every procedure listed**, in the
+  report's order: manipulation under anesthesia, each debridement (with
+  what and how much, e.g. "partial-thickness (~10%) supraspinatus tear"),
+  synovectomy, bursectomy, decompression, acromioplasty, ligament
+  release, lysis of adhesions, and so on. Give each `side` and `region`.
+  The **post-operative diagnoses** go in `diagnoses` with
+  `"basis": "objective"`, because surgery confirmed them.
+- **`region`** on every diagnosis and procedure: "Cervical spine",
+  "Thoracic spine", "Lumbar spine", "Left shoulder", "Right knee", and so
+  on.
+- **`scheduled`:** anything the record says is scheduled or booked, with
+  its date. For example `[{"what": "cervical spine surgery", "date":
+  "2026-06-17", "page": 2, "quote": "..."}]`. It is not a procedure until
+  a record shows it done.
+- **`event.headline`**, up to about 40 words, like a paralegal's
+  chronology entry: the complaints with pain scores, the key exam findings
+  (named tests), the assessment, and the plan. For example: "Bilateral
+  shoulder pain (right 6/10, left 8-10/10); positive Hawkins/Neer left;
+  assessed bilateral shoulder internal derangement; left-shoulder
+  arthroscopy offered." Include DME or prescriptions issued.
+
 ```json
 "imaging": [{"date": "2025-10-31", "modality": "MRI", "bodyPart": "cervical spine", "side": "",
   "facility": "Lenox Hill Radiology", "radiologist": "Dr. X",
