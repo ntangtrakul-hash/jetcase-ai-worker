@@ -203,12 +203,16 @@ is built from exactly this):
   `radiologist` on every study, `clinician` on every visit, procedure and
   report ("Dr. Muhammad Moral, MD", not "Moral" or initials).
 - **`provider`** is the facility or practice name as written.
-  **`facilityAddress`** is its street address when the record shows one.
+  **`facilityAddress`** is its street address when that file prints one.
   **`facilityPhone`**, **`facilityFax`** and **`facilityEmail`**: the
   facility's own phone, fax and email as printed on its letterhead,
-  header or footer. Leave each out when the record doesn't show it. Never
-  the patient's, an insurer's or the law firm's. (They fill the firm's
-  Medical Bills contact fields.)
+  header or footer -- on `other` pages too (a referral or prescription on
+  the practice's letterhead). **Only what is printed in that file: never
+  infer, complete or borrow one** from another provider in the folder (a
+  practice in the same building is still a different address). Leave each
+  out when the file doesn't show it. Never the patient's, an insurer's, a
+  software vendor's or the law firm's. (They fill the firm's Medical Bills
+  contact fields.)
 - **Operative reports:** in `procedures`, **every procedure listed**, in the
   report's order: manipulation under anesthesia, each debridement (with
   what and how much, e.g. "partial-thickness (~10%) supraspinatus tear"),
