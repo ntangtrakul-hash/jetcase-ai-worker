@@ -18,6 +18,8 @@ skills. The firm's routine stays the same.
 | `ROUTINE_PROMPT.md` | The routine's instructions. Paste it into the routine. |
 | `setup.sh` | The cloud environment's setup script. It installs poppler, tesseract and ocrmypdf. |
 | `.claude/skills/careful-medical-checklist/SKILL.md` | How to read the folder and what to report. |
+| `.claude/agents/record-reader.md` | The main reader, for a batch of records (the routine's own model). |
+| `.claude/agents/therapy-note-reader.md` | The quick reader (Haiku), for batches of therapy daily notes only. It leaves anything else to the main reader, and jetcase checks its dates against their quotes. |
 | `bin/jetcase-job.mjs` | The only way the routine talks to jetcase. It has no dependencies. |
 
 How a run works:

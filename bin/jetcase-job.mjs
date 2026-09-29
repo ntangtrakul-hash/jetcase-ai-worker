@@ -4,7 +4,11 @@
 // inside the routine's own sandbox, and is gone when the run ends.
 //
 //   node bin/jetcase-job.mjs start <job token>   save the token, fetch the job -> work/job.json
-//   node bin/jetcase-job.mjs download            every file -> work/files/, index in work/files.json
+//   node bin/jetcase-job.mjs download            every file -> work/files/ (4 at a time), text layers -> work/text/,
+//                                                index in work/files.json (pages, needsOcr, hint)
+//   node bin/jetcase-job.mjs ocr                 OCR the files with no usable text layer (2 at a time) -> work/text/
+//   node bin/jetcase-job.mjs batches             split the files still to read into batches, each with its reader
+//                                                -> work/batches.json
 //   node bin/jetcase-job.mjs save [ledger file]  send new/changed ledger lines to jetcase (saved at once)
 //   node bin/jetcase-job.mjs pending             save, then list files not yet in the ledger (work/ledger/*.jsonl)
 //   node bin/jetcase-job.mjs assemble            ledger + category notes -> work/result.json
@@ -23,11 +27,17 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 
 const WORK = path.resolve(process.cwd(), 'work');
 const TOKEN_FILE = path.join(WORK, '.token');
 const SAVE_CHUNK = 25;
+const DOWNLOAD_AT_ONCE = 4;
+const OCR_AT_ONCE = 2;
+const MIN_TEXT_PER_PAGE = 50;    // fewer letters per page than this, on average: a scan, needs OCR
+const BATCH_FILES = 12;
+const BATCH_PAGES = 80;          // a batch of long records is split sooner
+const BIG_FILE_PAGES = 25;       // a file this long gets a batch of its own
 
 function die(msg) {
   console.error('ERROR: ' + msg);
@@ -102,7 +112,7 @@ async function cmdStart(tok) {
     console.log('This is a TEST run. Run "node bin/jetcase-job.mjs test" and stop.');
     return;
   }
-  console.log(`Job ${job.jobId}: matter ${job.ourFile}, plaintiff "${job.plaintiffName || '(single plaintiff)'}"`);
+  console.log(`Job ${job.jobId}: matter ${job.ourFile}, plaintiff "${job.patientName || job.plaintiffName || '(single plaintiff)'}"${(job.coPlaintiffs || []).length ? ` (co-plaintiffs on this matter: ${job.coPlaintiffs.join(', ')} -- their records are not this plaintiff's)` : ''}`);
   const c = job.counts || { total: job.files.length, toRead: job.files.length, known: 0 };
   console.log(`${job.categories.length} categories. ${c.total} files in the folder: ${c.toRead} to read, ${c.known} already read (see "known" in work/job.json -- do NOT open those again).`);
   if (!job.files.length) console.log('Nothing new to read. Judge the folder from "known", write work/category-notes.json if needed, then run assemble, check and submit.');
@@ -111,35 +121,182 @@ async function cmdStart(tok) {
   if (big.length) console.log(`${big.length} file(s) over 60MB cannot be downloaded -- list them as unreadable: ${big.map(f => f.name).join(', ')}`);
 }
 
+// Runs fn over items, `limit` at a time, in order of start.
+async function pool(items, limit, fn) {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) { const i = next++; await fn(items[i], i); }
+  });
+  await Promise.all(workers);
+}
+
+function run(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => execFile(cmd, args, Object.assign({ maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' }, opts), (err, stdout, stderr) => (err ? reject(Object.assign(err, { stderr })) : resolve(stdout))));
+}
+
+function readIndex() {
+  const p = path.join(WORK, 'files.json');
+  if (!fs.existsSync(p)) die('Run download first.');
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
+
+function writeIndex(index) {
+  fs.writeFileSync(path.join(WORK, 'files.json'), JSON.stringify(index, null, 2));
+}
+
+const THERAPY_RE = /physical\s+therap|\bP\.?T\.?\b|chiropract|acupunct|daily\s+(?:note|treatment)|treatment\s+note|visit\s+note|\bSOAP\b|flow\s*sheet|therapeutic\s+exercise|manual\s+therapy|adjustment/i;
+const EVAL_RE = /initial\s+(?:eval|exam|consult|visit)|re-?\s?eval|re-?\s?exam|progress\s+(?:note|report|summary)|discharge|plan\s+of\s+care|functional\s+capacity|narrative|report\s+of|impression:/i;
+
+// What the text layer says about a file, before anyone reads it: its pages,
+// whether it needs OCR, and a hint for which reader gets it. A hint only --
+// the reader still opens the file and decides.
+function textFacts(entry, text, pages) {
+  const letters = (text.match(/[A-Za-z]/g) || []).length;
+  entry.pages = pages || entry.pages || null;
+  entry.textChars = letters;
+  entry.needsOcr = letters < MIN_TEXT_PER_PAGE * Math.max(1, pages || 1);
+  entry.hint = !entry.needsOcr && THERAPY_RE.test(text) && !EVAL_RE.test(text) && (pages || 1) <= 3 ? 'therapy-daily' : null;
+}
+
+function pdfPages(file) {
+  try { const m = execFileSync('pdfinfo', [file], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).match(/^Pages:\s+(\d+)/m); return m ? Number(m[1]) : null; } catch { return null; }
+}
+
+function textPath(id) {
+  return path.join(WORK, 'text', id.slice(-12).replace(/[^\w-]/g, '_') + '.txt');
+}
+
 async function cmdDownload() {
   const job = JSON.parse(fs.readFileSync(path.join(WORK, 'job.json'), 'utf8'));
   if (job.kind !== 'read') die('A test run has no files.');
   const dir = path.join(WORK, 'files');
   fs.mkdirSync(dir, { recursive: true });
-  const index = [];
+  fs.mkdirSync(path.join(WORK, 'text'), { recursive: true });
+  const index = new Array(job.files.length);
   let ok = 0;
-  await progress('downloading', 0, job.files.length);
   let n = 0;
-  for (const f of job.files) {
-    if (++n % 20 === 0) await progress('downloading', n, job.files.length);
+  await progress('downloading', 0, job.files.length);
+  await pool(job.files, DOWNLOAD_AT_ONCE, async (f, i) => {
     const local = path.join(dir, f.id.slice(-12).replace(/[^\w-]/g, '_') + '__' + safeName(f.name));
     const entry = { id: f.id, name: f.name, folderPath: f.folderPath, size: f.size, local: path.relative(process.cwd(), local), error: null };
-    if (f.tooLarge) { entry.error = 'larger than 60MB'; index.push(entry); continue; }
-    if (fs.existsSync(local) && fs.statSync(local).size === f.size) { ok++; index.push(entry); continue; }
-    try {
-      const resp = await call('GET', '/files/' + encodeURIComponent(f.id), { raw: true });
-      fs.writeFileSync(local, Buffer.from(await resp.arrayBuffer()));
-      ok++;
-    } catch (err) {
-      entry.error = err.message;
-      console.error(`  could not download ${f.name}: ${err.message}`);
+    index[i] = entry;
+    if (f.tooLarge) { entry.error = 'larger than 60MB'; return; }
+    if (!(fs.existsSync(local) && fs.statSync(local).size === f.size)) {
+      try {
+        const resp = await call('GET', '/files/' + encodeURIComponent(f.id), { raw: true });
+        fs.writeFileSync(local, Buffer.from(await resp.arrayBuffer()));
+      } catch (err) {
+        entry.error = err.message;
+        console.error(`  could not download ${f.name}: ${err.message}`);
+        return;
+      }
     }
-    index.push(entry);
+    ok++;
+    if (++n % 20 === 0) await progress('downloading', n, job.files.length);
+  });
+  // The text layer, once, here -- so no reader finds out on its own that a
+  // file is a scan, and the batches can be planned by pages.
+  let scans = 0;
+  for (const e of index) {
+    if (e.error) continue;
+    const ext = path.extname(e.name).toLowerCase();
+    if (ext === '.pdf') {
+      let text = '';
+      try { text = execFileSync('pdftotext', ['-layout', e.local, '-'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { text = ''; }
+      textFacts(e, text, pdfPages(e.local));
+      if (!e.needsOcr) { fs.writeFileSync(textPath(e.id), text); e.text = path.relative(process.cwd(), textPath(e.id)); }
+    } else if (['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.heic', '.bmp'].includes(ext)) {
+      e.pages = 1; e.needsOcr = true; e.hint = null;
+    }
+    if (e.needsOcr) scans++;
   }
-  fs.writeFileSync(path.join(WORK, 'files.json'), JSON.stringify(index, null, 2));
+  writeIndex(index);
   const before = (job.counts && job.counts.savedThisJob) || 0;
   await progress('reading', before + ledgerIds().size, before + job.files.length);
-  console.log(`Downloaded ${ok} of ${job.files.length} files into work/files/. Index (id -> local path) in work/files.json.`);
+  console.log(`Downloaded ${ok} of ${job.files.length} files into work/files/. Index in work/files.json (text layer in work/text/ where there is one).`);
+  if (scans) console.log(`${scans} file(s) have no usable text layer. Start "node bin/jetcase-job.mjs ocr" in the background now, and hand out the other files meanwhile.`);
+  const daily = index.filter(e => e && e.hint === 'therapy-daily').length;
+  if (daily) console.log(`${daily} file(s) look like therapy daily notes (a hint only). Run "node bin/jetcase-job.mjs batches" to split the work.`);
+}
+
+// OCR for the scans download found, OCR_AT_ONCE at a time (each with 2
+// jobs), so the container's CPU isn't fought over by every reader.
+async function cmdOcr() {
+  const index = readIndex();
+  const todo = index.filter(e => e && !e.error && e.needsOcr && !e.text);
+  if (!todo.length) { console.log('Nothing to OCR.'); return; }
+  fs.mkdirSync(path.join(WORK, 'ocr'), { recursive: true });
+  let done = 0;
+  await progress('ocr', 0, todo.length);
+  await pool(todo, OCR_AT_ONCE, async e => {
+    const ext = path.extname(e.name).toLowerCase();
+    try {
+      let text;
+      if (ext === '.pdf') {
+        const out = path.join(WORK, 'ocr', path.basename(e.local));
+        await run('ocrmypdf', ['--force-ocr', '--deskew', '--rotate-pages', '-l', 'eng', '--jobs', '2', '--quiet', e.local, out]);
+        text = await run('pdftotext', ['-layout', out, '-']);
+        e.ocrPdf = path.relative(process.cwd(), out);
+      } else {
+        text = await run('tesseract', [e.local, 'stdout', '--psm', '6']);
+      }
+      fs.writeFileSync(textPath(e.id), text);
+      e.text = path.relative(process.cwd(), textPath(e.id));
+      e.ocrChars = (text.match(/[A-Za-z]/g) || []).length;
+    } catch (err) {
+      e.ocrError = String((err.stderr || err.message || '')).split('\n').filter(Boolean).slice(-1)[0] || 'OCR failed';
+      console.error(`  OCR failed for ${e.name}: ${e.ocrError} -- the reader looks at the page images`);
+    }
+    done++;
+    writeIndex(index);
+    await progress('ocr', done, todo.length);
+  });
+  console.log(`OCR done for ${todo.filter(e => e.text).length} of ${todo.length} file(s). Text in work/text/ (see "text" in work/files.json). Run batches again for the rest.`);
+}
+
+// Splits the files still to read (not in the ledger) into batches: therapy
+// daily notes with a text layer go to the quick reader, everything else to
+// the main reader. Scans still waiting for OCR are held back.
+function cmdBatches() {
+  const job = JSON.parse(fs.readFileSync(path.join(WORK, 'job.json'), 'utf8'));
+  if (job.kind !== 'read') die('A test run has no files.');
+  const index = readIndex();
+  const done = ledgerIds();
+  const existing = fs.existsSync(path.join(WORK, 'ledger')) ? fs.readdirSync(path.join(WORK, 'ledger')).filter(n => /^batch-\d+\.jsonl$/.test(n)) : [];
+  let prevBatches = [];
+  try { prevBatches = JSON.parse(fs.readFileSync(path.join(WORK, 'batches.json'), 'utf8')); } catch { /* none yet */ }
+  let num = Math.max(0, ...existing.map(n => Number(n.match(/\d+/)[0])), ...prevBatches.map(b => Number(String(b.name).match(/\d+/)[0]) || 0));
+  // A file the quick reader left (not a plain daily note) goes to the main reader.
+  const quickHad = new Set(prevBatches.filter(b => b.reader === 'therapy-note-reader').flatMap(b => b.ids));
+  const left = index.filter(e => e && !done.has(e.id));
+  const waiting = left.filter(e => e.needsOcr && !e.text && !e.ocrError && !e.error);
+  const ready = left.filter(e => !waiting.includes(e));
+  const quick = ready.filter(e => e.hint === 'therapy-daily' && !quickHad.has(e.id));
+  const main = ready.filter(e => !quick.includes(e));
+  const batches = [];
+  // Biggest first, so a 35-page file starts at minute 0 instead of being
+  // the tail of the run (Diane Harding 2026-09-29: the last 2 files took
+  // 25 of 49 minutes). A file over BIG_FILE_PAGES gets a batch of its own.
+  const bySize = list => list.slice().sort((a, b) => (b.pages || 1) - (a.pages || 1));
+  const cut = (list, reader, maxFiles, maxPages) => {
+    let cur = null;
+    for (const e of bySize(list)) {
+      const pages = e.pages || 1;
+      if (!cur || cur.ids.length >= maxFiles || (cur.pages + pages > maxPages && cur.ids.length) || pages > BIG_FILE_PAGES || cur.big) {
+        cur = { name: `batch-${String(++num).padStart(2, '0')}`, reader, ids: [], pages: 0, big: pages > BIG_FILE_PAGES };
+        batches.push(cur);
+      }
+      cur.ids.push(e.id);
+      cur.pages += pages;
+    }
+  };
+  cut(quick, 'therapy-note-reader', BATCH_FILES + 3, BATCH_PAGES);
+  cut(main, 'record-reader', BATCH_FILES, BATCH_PAGES);
+  // Start the batches in this order: the biggest are first.
+  fs.writeFileSync(path.join(WORK, 'batches.json'), JSON.stringify(prevBatches.concat(batches), null, 2));
+  console.log(`${left.length} file(s) still to read: ${batches.length} new batch(es) in work/batches.json${waiting.length ? `, ${waiting.length} scan(s) held back until ocr finishes` : ''}.`);
+  const nameOf = new Map(index.filter(Boolean).map(e => [e.id, e.name]));
+  batches.forEach(b => console.log(`  ${b.name}  ${b.reader}  ${b.ids.length} file(s), ~${b.pages} page(s): ${b.ids.map(id => nameOf.get(id)).join('; ').slice(0, 300)}`));
 }
 
 // The ledger: one JSON object per line, one line per file, in
@@ -291,6 +448,7 @@ async function cmdCheck(file) {
     await progress('checking', null, null);
     const out = await call('POST', '/check', { body });
     console.log('CHECK PASSED (nothing saved yet): ' + JSON.stringify(out.summary));
+    (out.summary.warnings || []).forEach(w => console.log('WARNING: ' + w));
     if (out.summary.unknownDocs && out.summary.unknownDocs.length) console.log('Unknown documents (fix the ids/names): ' + out.summary.unknownDocs.join('; '));
   } catch (err) {
     die(`CHECK FAILED: ${err.message}\nFix work/result.json and run check again.`);
@@ -333,9 +491,10 @@ async function cmdTest() {
 }
 
 const [cmd, arg] = process.argv.slice(2);
-const run = { start: () => cmdStart(arg), download: cmdDownload, save: () => cmdSave(arg), pending: cmdPending, assemble: cmdAssemble, check: () => cmdCheck(arg), submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest }[cmd];
-if (!run) {
-  console.log('usage: node bin/jetcase-job.mjs start <token> | download | save [ledger file] | pending | assemble | check <result.json> | submit <result.json> | fail "<reason>" | test');
+const commands = { start: () => cmdStart(arg), download: cmdDownload, ocr: cmdOcr, batches: async () => cmdBatches(), save: () => cmdSave(arg), pending: cmdPending, assemble: cmdAssemble, check: () => cmdCheck(arg), submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest };
+const cmdFn = Object.hasOwn(commands, cmd) ? commands[cmd] : null;
+if (!cmdFn) {
+  console.log('usage: node bin/jetcase-job.mjs start <token> | download | ocr | batches | save [ledger file] | pending | assemble | check <result.json> | submit <result.json> | fail "<reason>" | test');
   process.exit(1);
 }
-run().catch(err => die(err.message));
+cmdFn().catch(err => die(err.message));

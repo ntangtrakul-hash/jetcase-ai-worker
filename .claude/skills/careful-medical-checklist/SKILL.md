@@ -60,8 +60,15 @@ node bin/jetcase-job.mjs download
   - `files`: the files **to read**;
   - `known`: files already read, not to open again;
   - `counts`.
-- `download` fetches only the files to read into `work/files/`, with an
-  index in `work/files.json`.
+- `download` fetches only the files to read into `work/files/`, 4 at a
+  time, and checks each file's text layer once. `work/files.json` gives
+  every file's local path, `pages`, its text (`text`, in `work/text/`) when
+  it has a usable text layer, `needsOcr` for scans, and a `hint`
+  (`therapy-daily` when the text looks like a therapy daily note; only a
+  hint).
+- **If download reports scans**, start `node bin/jetcase-job.mjs ocr` in
+  the background (Bash with run_in_background) straight away. It OCRs 2 at
+  a time into `work/text/`, while the other files are being read.
 - **If `files` is empty**, skip to step 3.
 
 ### 2. Read each file into the ledger
@@ -84,15 +91,22 @@ line in the ledger and save again.
 - **Up to about 25 files:** read them yourself, in batches of about 10
   (`batch-01.jsonl`, `batch-02.jsonl`, …).
 - **More than about 25 files: you only coordinate.** Don't open records
-  yourself, so your own context stays small for the whole run. If you can
-  start subagents (the Task tool), run **3 or 4 at a time**, each with
-  about 10–12 file ids and these instructions: "read every file in your
-  batch and write one ledger line per file to `work/ledger/batch-NN.jsonl`,
-  following `.claude/skills/careful-medical-checklist/SKILL.md`. Run
-  `node bin/jetcase-job.mjs save work/ledger/batch-NN.jsonl` after every 3
-  to 5 files and once more at the end, and fix any line it rejects." When
-  one finishes, run `pending` and start the next batch from what's left.
-  Without subagents, read in batches of about 10 yourself.
+  yourself, so your own context stays small for the whole run.
+  1. Run `node bin/jetcase-job.mjs batches`. It splits the files still to
+     read into `work/batches.json`, each batch with its **reader**:
+     - `therapy-note-reader` (a quick, cheaper model) for files that look
+       like therapy daily notes. It records only plain daily notes and
+       leaves anything else;
+     - `record-reader` (the main reader) for everything else.
+     Scans still being OCR'd are held back until `ocr` finishes.
+  2. Start subagents (the Task tool) with the agent type the batch names,
+     **3 or 4 at a time**. Tell each one: "Read batch batch-NN (ids in
+     work/batches.json) into work/ledger/batch-NN.jsonl."
+  3. When one finishes, run `pending`, then start the next batch.
+  4. When the batches run out, run `batches` again: it gives the files the
+     quick reader left, and the scans OCR has finished, to `record-reader`.
+  - Without subagents, read in batches of about 10 yourself, all as the
+    main reader.
 
 Repeat until `pending` says **0 still to read**.
 
@@ -140,6 +154,24 @@ retry and don't report anything else.
 - `kind`: `"record"` (a medical record), `"other"` (read, not a medical
   record: say what it is; a duplicate is `"duplicate of <file>"`), or
   `"unreadable"`.
+- **Whose record is it?** `work/job.json` has `patientName` (this
+  plaintiff) and `coPlaintiffs` (the matter's other plaintiffs). Check the
+  patient name **on every page**, not just the first.
+  - **Someone else's record** (a co-plaintiff's or anyone's): write **one
+    line and stop**. No dates, no diagnoses, no facts: `"kind": "other"`,
+    `"otherPatient": {"name": "<their name as printed>"}`, `"what":
+    "another patient's record: <name> - <what it is>"`. jetcase keeps it
+    off this plaintiff's checklist, flags it on the card, and offers to
+    move a co-plaintiff's files into their own folder.
+  - **A mixed file** (some pages this plaintiff's, some someone else's):
+    read this plaintiff's pages as usual, and add `"otherPatient": {"name":
+    "<name>", "pages": "1-2, 17-35"}` for the other person's pages. jetcase
+    drops any fact on those pages. Name it in a flag too.
+  - **A name that isn't quite the plaintiff's** (a married name, a typo,
+    only a surname): jetcase rejects the line until you say which. Set
+    `"patientConfirmed": true` if it is the plaintiff, or `otherPatient`
+    if it isn't.
+- `readBy`: only the quick reader writes it (`"haiku"`); leave it out.
 - `packetGroup`: `procedure` (operative or injection report), `physician`,
   `mri`, `imaging` (CT, X-ray, ultrasound), `emg`, `therapy` (PT, chiro,
   acupuncture) or `admin`.
@@ -150,9 +182,12 @@ retry and don't report anything else.
   the filename. A PT progress note listing visits gives each date.
 - `visitType`: `initial`, `follow-up`, `re-evaluation`, `procedure`,
   `discharge` or `study` (imaging or EMG).
-- `provider`: the billing practice or facility, spelled one way across the
-  whole folder (it creates the firm's Medical Bills rows). `clinician` is
-  the person.
+- `provider`: the billing practice or facility **exactly as on the
+  letterhead**, spelled one way across the whole folder (it creates the
+  firm's Medical Bills rows). No notes in it: not "(ordered by …)", not
+  "(DME)". `clinician` is the person.
+- **Orders are `"other"`, line tier:** referrals, prescriptions, DME orders
+  and radiology orders, whoever wrote them, from every reader alike.
 
 **Full-tier fields**, where they apply. Each item carries `page` and
 `quote`.
@@ -255,6 +290,12 @@ meaning your files plus `known`:
 
 - `partial` only for a category that has records.
 - `not_applicable` only for one that has none.
+- **Check the visit counts.** When a progress note, re-evaluation or
+  discharge summary states how many visits there have been ("12 visits to
+  date"), compare it with the daily-note dates in the ledger and `known`
+  for that provider. If they don't match, give the files that would
+  explain it to `record-reader` to re-read (drop their lines from the
+  ledger first). If they still don't match, say so in a flag.
 
 Optional files: `work/flags.json`, e.g. `[{"message": "...", "detail":
 "..."}]` for a cross-filed record, a corrupt file or a name mismatch; and
