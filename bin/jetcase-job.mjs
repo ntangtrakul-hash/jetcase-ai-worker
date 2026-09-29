@@ -5,7 +5,8 @@
 //
 //   node bin/jetcase-job.mjs start <job token>   save the token, fetch the job -> work/job.json
 //   node bin/jetcase-job.mjs download            every file -> work/files/, index in work/files.json
-//   node bin/jetcase-job.mjs pending             files not yet in the ledger (work/ledger/*.jsonl)
+//   node bin/jetcase-job.mjs save [ledger file]  send new/changed ledger lines to jetcase (saved at once)
+//   node bin/jetcase-job.mjs pending             save, then list files not yet in the ledger (work/ledger/*.jsonl)
 //   node bin/jetcase-job.mjs assemble            ledger + category notes -> work/result.json
 //   node bin/jetcase-job.mjs check work/result.json    jetcase's checks, nothing saved
 //   node bin/jetcase-job.mjs submit work/result.json
@@ -14,6 +15,11 @@
 //
 // jetcase's address comes ONLY from the environment's JETCASE_URL, never
 // from the job text -- so a run can't be pointed anywhere else.
+//
+// Entries are saved in jetcase as the ledger grows (save, and pending runs
+// it first), so a run that dies -- the token expires, the session ends --
+// loses at most the batch it was on. Running "start" again (same token), or
+// the next careful read, lists only the files not saved yet.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -21,6 +27,7 @@ import { execFileSync } from 'node:child_process';
 
 const WORK = path.resolve(process.cwd(), 'work');
 const TOKEN_FILE = path.join(WORK, '.token');
+const SAVE_CHUNK = 25;
 
 function die(msg) {
   console.error('ERROR: ' + msg);
@@ -60,6 +67,9 @@ async function call(method, p, { body, raw } = {}) {
   const text = await resp.text();
   let data;
   try { data = JSON.parse(text); } catch { data = { error: text.slice(0, 300) }; }
+  if (resp.status === 401) {
+    die('This job has ended or its token has expired. Everything already saved stays in jetcase, and the next careful read continues from there. Stop here: do not retry or report anything else.');
+  }
   if (!resp.ok) {
     const e = new Error((data && data.error) || `HTTP ${resp.status}`);
     e.status = resp.status;
@@ -96,6 +106,7 @@ async function cmdStart(tok) {
   const c = job.counts || { total: job.files.length, toRead: job.files.length, known: 0 };
   console.log(`${job.categories.length} categories. ${c.total} files in the folder: ${c.toRead} to read, ${c.known} already read (see "known" in work/job.json -- do NOT open those again).`);
   if (!job.files.length) console.log('Nothing new to read. Judge the folder from "known", write work/category-notes.json if needed, then run assemble, check and submit.');
+  if (c.savedThisJob) console.log(`${c.savedThisJob} of them were already saved by this job before a restart -- they are under "known" and are not to be read again.`);
   const big = job.files.filter(f => f.tooLarge);
   if (big.length) console.log(`${big.length} file(s) over 60MB cannot be downloaded -- list them as unreadable: ${big.map(f => f.name).join(', ')}`);
 }
@@ -126,33 +137,117 @@ async function cmdDownload() {
     index.push(entry);
   }
   fs.writeFileSync(path.join(WORK, 'files.json'), JSON.stringify(index, null, 2));
-  await progress('reading', ledgerIds().size, job.files.length);
+  const before = (job.counts && job.counts.savedThisJob) || 0;
+  await progress('reading', before + ledgerIds().size, before + job.files.length);
   console.log(`Downloaded ${ok} of ${job.files.length} files into work/files/. Index (id -> local path) in work/files.json.`);
 }
 
 // The ledger: one JSON object per line, one line per file, in
 // work/ledger/*.jsonl (one file per batch, so parallel helpers never write
 // the same file). Only `id` matters here; the skill defines the rest.
-function ledgerIds() {
+// @returns Map id -> { entry, line, file } (a later line for a file wins)
+function readLedger({ only = null, strict = false } = {}) {
   const dir = path.join(WORK, 'ledger');
-  const ids = new Set();
-  if (!fs.existsSync(dir)) return ids;
-  for (const f of fs.readdirSync(dir).filter(n => n.endsWith('.jsonl'))) {
-    fs.readFileSync(path.join(dir, f), 'utf8').split('\n').forEach((line, i) => {
+  const byId = new Map();
+  if (!fs.existsSync(dir)) return byId;
+  const names = only ? [path.basename(only)] : fs.readdirSync(dir).filter(n => n.endsWith('.jsonl')).sort();
+  for (const f of names) {
+    const p = path.join(dir, f);
+    if (!fs.existsSync(p)) die(`No ledger file ${path.relative(process.cwd(), p)}.`);
+    fs.readFileSync(p, 'utf8').split('\n').forEach((line, i) => {
       if (!line.trim()) return;
-      try { const e = JSON.parse(line); if (e && e.id) ids.add(e.id); } catch { console.error(`  ${f} line ${i + 1} is not valid JSON -- fix it`); }
+      let e;
+      try { e = JSON.parse(line); } catch {
+        if (strict) die(`${f} line ${i + 1} is not valid JSON -- fix it and run assemble again.`);
+        console.error(`  ${f} line ${i + 1} is not valid JSON -- fix it`);
+        return;
+      }
+      if (e && e.id) byId.set(e.id, { entry: e, line: line.trim(), file: f });
     });
   }
-  return ids;
+  return byId;
+}
+
+function ledgerIds() {
+  return new Set(readLedger().keys());
+}
+
+// What was already sent, per ledger file (work/saved/<batch>.json: id ->
+// line hash), so parallel helpers never write the same state file and a
+// changed line is sent again.
+function savedState(ledgerFile) {
+  const p = path.join(WORK, 'saved', ledgerFile.replace(/\.jsonl$/, '') + '.json');
+  let state = {};
+  try { state = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { /* none yet */ }
+  return { state, write: () => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(state)); } };
+}
+
+function hashLine(line) {
+  let h = 0;
+  for (let i = 0; i < line.length; i++) h = (Math.imul(h, 31) + line.charCodeAt(i)) | 0;
+  return String(h >>> 0) + ':' + line.length;
+}
+
+// Sends new or changed ledger lines to jetcase, where they are saved at
+// once. A rejected line is named with the reason: fix it in the ledger and
+// save again. @returns { sent, saved, rejected, savedThisJob, toRead }
+async function saveLedger(only = null, { quiet = false } = {}) {
+  const job = JSON.parse(fs.readFileSync(path.join(WORK, 'job.json'), 'utf8'));
+  if (job.kind !== 'read') die('A test run has no files.');
+  const want = new Set(job.files.map(f => f.id));
+  const byFile = new Map();
+  for (const [id, x] of readLedger({ only })) {
+    if (!want.has(id)) continue;
+    if (!byFile.has(x.file)) byFile.set(x.file, []);
+    byFile.get(x.file).push(x);
+  }
+  const out = { sent: 0, saved: 0, rejected: [], savedThisJob: null, toRead: null };
+  for (const [file, lines] of byFile) {
+    const st = savedState(file);
+    const fresh = lines.filter(x => st.state[x.entry.id] !== hashLine(x.line));
+    for (let i = 0; i < fresh.length; i += SAVE_CHUNK) {
+      const chunk = fresh.slice(i, i + SAVE_CHUNK);
+      const res = await call('POST', '/entries', { body: { entries: chunk.map(x => x.entry) } });
+      const bad = new Set(res.rejected.map(r => r.id));
+      chunk.forEach(x => { if (!bad.has(x.entry.id)) st.state[x.entry.id] = hashLine(x.line); });
+      st.write();
+      out.sent += chunk.length;
+      out.saved += res.saved;
+      out.rejected.push(...res.rejected.map(r => Object.assign({ ledger: file }, r)));
+      out.savedThisJob = res.savedThisJob;
+      out.toRead = res.toRead;
+    }
+  }
+  if (!quiet || out.sent) {
+    if (out.sent) console.log(`Saved ${out.saved} of ${out.sent} new or changed ledger line(s) in jetcase${out.savedThisJob != null ? ` (${out.savedThisJob} of ${out.toRead} files to read saved so far)` : ''}.`);
+    else console.log('Nothing new to save.');
+  }
+  if (out.rejected.length) {
+    console.log(`REJECTED ${out.rejected.length} line(s) -- fix them in the ledger and run save again:`);
+    out.rejected.forEach(r => console.log(`  ${r.ledger}: ${r.name || r.id}: ${r.error}`));
+  }
+  return out;
+}
+
+async function cmdSave(file) {
+  await saveLedger(file || null);
 }
 
 async function cmdPending() {
   const job = JSON.parse(fs.readFileSync(path.join(WORK, 'job.json'), 'utf8'));
   if (job.kind !== 'read') die('A test run has no files.');
+  // Save first, so the ledger is in jetcase before anything else can fail.
+  let rejected = [];
+  try { rejected = (await saveLedger(null, { quiet: true })).rejected; } catch (err) { console.error(`  could not save to jetcase (${err.message}) -- run save again later`); }
+  // A line jetcase rejected is still to do: it has to be fixed and saved.
   const done = ledgerIds();
+  rejected.forEach(r => done.delete(r.id));
   const left = job.files.filter(f => !done.has(f.id));
-  await progress('reading', job.files.length - left.length, job.files.length);
-  console.log(`${job.files.length - left.length} of ${job.files.length} files are in the ledger; ${left.length} still to read.`);
+  // Counted over every file this job was given, including the ones saved
+  // before a restart, so the card's "N of M" never goes backwards.
+  const before = (job.counts && job.counts.savedThisJob) || 0;
+  await progress('reading', before + job.files.length - left.length, before + job.files.length);
+  console.log(`${job.files.length - left.length} of ${job.files.length} files are in the ledger and saved; ${left.length} still to read${rejected.length ? ` (${rejected.length} of them rejected -- fix the line)` : ''}.`);
   left.forEach(f => console.log(`  ${f.id}\t${f.folderPath ? f.folderPath + '/' : ''}${f.name}`));
 }
 
@@ -160,19 +255,11 @@ async function cmdPending() {
 // is one file's entry) plus the optional work/category-notes.json,
 // work/flags.json and work/notes.txt -- so the result is never retyped by
 // hand, and jetcase builds the checklist from the entries.
-function cmdAssemble() {
+async function cmdAssemble() {
   const job = JSON.parse(fs.readFileSync(path.join(WORK, 'job.json'), 'utf8'));
-  const dir = path.join(WORK, 'ledger');
-  const byId = new Map();
-  if (fs.existsSync(dir)) {
-    for (const f of fs.readdirSync(dir).filter(n => n.endsWith('.jsonl')).sort()) {
-      fs.readFileSync(path.join(dir, f), 'utf8').split('\n').forEach((line, i) => {
-        if (!line.trim()) return;
-        let e;
-        try { e = JSON.parse(line); } catch { die(`${f} line ${i + 1} is not valid JSON -- fix it and run assemble again.`); }
-        if (e && e.id) byId.set(e.id, e); // a later line for the same file wins
-      });
-    }
+  const byId = new Map([...readLedger({ strict: true })].map(([id, x]) => [id, x.entry]));
+  if (job.kind === 'read') {
+    try { await saveLedger(null, { quiet: true }); } catch (err) { console.error(`  could not save to jetcase (${err.message}) -- the result still carries every entry`); }
   }
   const readJson = (name, fallback) => {
     const p = path.join(WORK, name);
@@ -246,9 +333,9 @@ async function cmdTest() {
 }
 
 const [cmd, arg] = process.argv.slice(2);
-const run = { start: () => cmdStart(arg), download: cmdDownload, pending: cmdPending, assemble: async () => cmdAssemble(), check: () => cmdCheck(arg), submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest }[cmd];
+const run = { start: () => cmdStart(arg), download: cmdDownload, save: () => cmdSave(arg), pending: cmdPending, assemble: cmdAssemble, check: () => cmdCheck(arg), submit: () => cmdSubmit(arg), fail: () => cmdFail(arg), test: cmdTest }[cmd];
 if (!run) {
-  console.log('usage: node bin/jetcase-job.mjs start <token> | download | pending | assemble | check <result.json> | submit <result.json> | fail "<reason>" | test');
+  console.log('usage: node bin/jetcase-job.mjs start <token> | download | save [ledger file] | pending | assemble | check <result.json> | submit <result.json> | fail "<reason>" | test');
   process.exit(1);
 }
 run().catch(err => die(err.message));

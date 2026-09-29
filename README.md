@@ -24,10 +24,15 @@ How a run works:
 1. jetcase starts the routine with a one-time job token.
 2. The routine runs `node bin/jetcase-job.mjs start <token>`, then
    `download`, reads everything, and runs `submit work/result.json`.
+   Each file's entry is saved in jetcase as it is read (`save` /
+   `pending`), so a run that is cut short loses at most one batch, and the
+   next run reads only what's left.
 3. jetcase checks the result against the firm's own checklist categories
    and saves it on the plaintiff's card.
 
 The token works only for that one plaintiff, and only until the job ends.
+It stays valid while the routine is working (6 hours from its latest call,
+24 hours at most).
 
 Setup steps for a firm: in jetcase, **Admin > Medical checklist > Careful
 read**. jetcase's own copy of the full guide is `docs/CAREFUL-READ-ONBOARDING.md`.

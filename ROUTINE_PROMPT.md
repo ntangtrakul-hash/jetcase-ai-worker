@@ -17,8 +17,10 @@ using that token:
 2. If it's a test run, run `node bin/jetcase-job.mjs test` and stop.
 3. Otherwise, download and read **every** file you are given into the
    ledger (files listed under "known" were read before, so don't open
-   them), run `assemble`, run `check` until it passes, then submit. Never
-   skip a file: jetcase rejects a result that leaves one out.
+   them), saving to jetcase as you go (`pending` after every batch), run
+   `assemble`, run `check` until it passes, then submit. Never skip a
+   file: jetcase rejects a result that leaves one out. On folders over
+   about 25 files, only coordinate: subagents read the files.
 
 Only talk to jetcase through `bin/jetcase-job.mjs`. Don't create
 branches, commit, push or open pull requests. Don't send any record or

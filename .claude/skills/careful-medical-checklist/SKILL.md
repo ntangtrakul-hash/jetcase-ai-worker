@@ -68,20 +68,39 @@ node bin/jetcase-job.mjs download
 
 The ledger is `work/ledger/*.jsonl`: **one JSON object per line, one line
 per file.** Write each line right after reading that file, never at the
-end. **Run `node bin/jetcase-job.mjs pending` after every batch.** It lists
-what's left and tells jetcase how far along you are, which the firm
-watches on the card.
+end.
+
+**Save as you go.** `work/` disappears when the run ends, so anything not
+saved in jetcase is lost if the run dies (the session ends, the token
+expires). `node bin/jetcase-job.mjs save` sends every new or changed
+ledger line to jetcase, where it is kept for good; `save
+work/ledger/batch-NN.jsonl` sends just that batch. **Run
+`node bin/jetcase-job.mjs pending` after every batch**: it saves first,
+then lists what's left and tells jetcase how far along you are, which the
+firm watches on the card. If `save` names a **REJECTED** line, fix that
+line in the ledger and save again.
 
 **Splitting the work:**
 - **Up to about 25 files:** read them yourself, in batches of about 10
   (`batch-01.jsonl`, `batch-02.jsonl`, …).
-- **More than about 25 files:** if you can start subagents (the Task tool),
-  give each one about 15 file ids and these instructions: "read every file
-  in your batch and write one ledger line per file to
-  `work/ledger/batch-NN.jsonl`, following
-  `.claude/skills/careful-medical-checklist/SKILL.md`". Run several at once.
+- **More than about 25 files: you only coordinate.** Don't open records
+  yourself, so your own context stays small for the whole run. If you can
+  start subagents (the Task tool), run **3 or 4 at a time**, each with
+  about 10–12 file ids and these instructions: "read every file in your
+  batch and write one ledger line per file to `work/ledger/batch-NN.jsonl`,
+  following `.claude/skills/careful-medical-checklist/SKILL.md`. Run
+  `node bin/jetcase-job.mjs save work/ledger/batch-NN.jsonl` after every 3
+  to 5 files and once more at the end, and fix any line it rejects." When
+  one finishes, run `pending` and start the next batch from what's left.
+  Without subagents, read in batches of about 10 yourself.
 
 Repeat until `pending` says **0 still to read**.
+
+**If the run is cut short:** everything saved stays in jetcase. Running
+`start` again with the same token (or the firm's next careful read) lists
+only the files not saved yet; the saved ones appear under `known`. If a
+command says the job has ended or its token has expired, stop: don't
+retry and don't report anything else.
 
 **How to read a file:**
 1. **Text layer first.** `pdftotext -layout file.pdf -`
@@ -251,8 +270,9 @@ node bin/jetcase-job.mjs assemble
 node bin/jetcase-job.mjs check work/result.json
 ```
 
-This runs jetcase's own checks and saves nothing. If it names files with no
-entry, read them, add their lines and assemble again. Also fix any bad
+This runs jetcase's own checks and saves no checklist (files already saved
+with `save` count as having an entry). If it names files with no entry,
+read them, add their lines and assemble again. Also fix any bad
 dates or unknown categories it names. Repeat until **CHECK PASSED**.
 
 ### 5. Submit
