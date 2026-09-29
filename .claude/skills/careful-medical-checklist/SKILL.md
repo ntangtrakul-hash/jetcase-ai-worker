@@ -204,6 +204,11 @@ is built from exactly this):
   report ("Dr. Muhammad Moral, MD", not "Moral" or initials).
 - **`provider`** is the facility or practice name as written.
   **`facilityAddress`** is its street address when the record shows one.
+  **`facilityPhone`**, **`facilityFax`** and **`facilityEmail`**: the
+  facility's own phone, fax and email as printed on its letterhead,
+  header or footer. Leave each out when the record doesn't show it. Never
+  the patient's, an insurer's or the law firm's. (They fill the firm's
+  Medical Bills contact fields.)
 - **Operative reports:** in `procedures`, **every procedure listed**, in the
   report's order: manipulation under anesthesia, each debridement (with
   what and how much, e.g. "partial-thickness (~10%) supraspinatus tear"),
